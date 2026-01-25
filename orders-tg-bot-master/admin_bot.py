@@ -1,204 +1,315 @@
-# admin_bot.py — функции административной панели
+# admin_bot.py
 
-import uuid
+import telebot
 from telebot import types
-import config
-import db
+from core.decorators import require_role
+from core.permissions import is_admin, is_staff
 
-# Временное хранилище этапов добавления/редактирования/удаления
-admin_workflow = {}
+from core.state import StateManager
+from core.permissions import (
+    is_admin,
+    is_manager,
+    is_staff,
+    can_manage_staff
+)
 
-# Получение списка сотрудников с ролями
-def get_role_dict():
-    """Возвращает словарь ролей с ID пользователей"""
-    users_from_db = db.ensure_and_get_users()
-    role_dict = {"admin": [], "manager": [], "tp": []}
-    admin_ids = config.ADMIN_CHAT_ID[:]
-    manager_ids = config.MANAGER_CHAT_ID[:]
-    tp_ids = config.TP_CHAT_ID[:]
-    
-    for uid, name, role in users_from_db:
-        if role in role_dict:
-            role_dict[role].append(uid)
-            if role == "admin" and uid not in admin_ids:
-                admin_ids.append(uid)
-            if role == "manager" and uid not in manager_ids:
-                manager_ids.append(uid)
-            if role == "tp" and uid not in tp_ids:
-                tp_ids.append(uid)
-    
-    return role_dict, admin_ids, manager_ids, tp_ids
+import db.employees as employees_db
+import db.db_tickets as tickets_db
+import db.db_faq as faq_db
 
-# Проверка роли
-def has_role(user_id, roles, role_dict):
-    return any(user_id in role_dict.get(r, []) for r in roles)
+state = StateManager()
 
-# Проверка доступа: либо роль, либо ID в конфиге
-def has_access(user_id, roles, role_dict):
-    if "admin" in roles and user_id in config.ADMIN_CHAT_ID:
-        return True
-    if "manager" in roles and user_id in config.MANAGER_CHAT_ID:
-        return True
-    if "tp" in roles and user_id in config.TP_CHAT_ID:
-        return True
-    return has_role(user_id, roles, role_dict)
 
-# Панель администратора
-def admin_panel(bot, message):
-    """Отображает панель администратора"""
-    role_dict, _, _, _ = get_role_dict()
-    
-    if not has_access(message.from_user.id, ["admin"], role_dict):
-        return bot.send_message(message.chat.id, "❌ У вас нет доступа к административной панели.")
+def register_handlers(bot):
 
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔧 Меню редактирования информации для клиента", callback_data="edit_client_info"))
-    keyboard.add(types.InlineKeyboardButton("👤 Редактирование учетных записей", callback_data="edit_accounts"))
-    keyboard.add(types.InlineKeyboardButton("👀 Просмотр учетных записей", callback_data="list_staff_menu"))
-    keyboard.add(types.InlineKeyboardButton("📁 Редактирование данных по клиенту", callback_data="edit_client_data"))
-    keyboard.add(types.InlineKeyboardButton("🔄 Запросы от менеджмента", callback_data="manager_requests"))
-    keyboard.add(types.InlineKeyboardButton("📌 Просмотр заявок", callback_data="view_requests"))
-    bot.send_message(message.chat.id, "⚖ Административная панель:", reply_markup=keyboard)
-
-# Обработчик callback-запросов для администратора
-def handle_admin_callback(bot, call):
-    """Обрабатывает callback-запросы администратора"""
-    role_dict, _, _, _ = get_role_dict()
-    
-    if not has_access(call.from_user.id, ["admin"], role_dict):
-        return bot.answer_callback_query(call.id, "❌ Нет доступа")
-
-    if call.data == "edit_accounts":
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("➕ Добавить сотрудника", callback_data="add_user"))
-        keyboard.add(types.InlineKeyboardButton("🛠 Редактировать операторов", callback_data="edit_tp"))
-        keyboard.add(types.InlineKeyboardButton("🛠 Редактировать менеджеров", callback_data="edit_manager"))
-        keyboard.add(types.InlineKeyboardButton("🛠 Редактировать администраторов", callback_data="edit_admin"))
-        keyboard.add(types.InlineKeyboardButton("↩ Назад", callback_data="back_to_main"))
-        bot.send_message(call.message.chat.id, "👤 Редактирование учетных записей:", reply_markup=keyboard)
-
-    elif call.data == "add_user":
-        gen_key = uuid.uuid4().hex[:8]
-        admin_workflow[call.from_user.id] = {"key": gen_key}
-        bot.send_message(call.message.chat.id, f"🆔 Сгенерирован уникальный ключ: <code>{gen_key}</code>")
-        bot.send_message(call.message.chat.id, "📝 Введите имя нового сотрудника или 'назад'")
-        bot.register_next_step_handler(call.message, lambda m: process_new_user_name(bot, m))
-
-    elif call.data == "list_staff":
-        users = db.ensure_and_get_users()
-        if not users:
-            return bot.send_message(call.message.chat.id, "⚠ Сотрудники не найдены.")
-
-        grouped = {"admin": [], "manager": [], "tp": []}
-        for uid, name, role in users:
-            if role in grouped:
-                grouped[role].append((uid, name))
-
-        text = "👥 <b>Список сотрудников:</b>\n\n"
-        for role, display in {"admin": "Администраторы", "manager": "Менеджеры", "tp": "Операторы"}.items():
-            if grouped[role]:
-                text += f"<b>{display}:</b>\n"
-                for uid, name in grouped[role]:
-                    is_base_admin = uid in config.ADMIN_CHAT_ID if role == "admin" else False
-                    mark = " (встроенный)" if is_base_admin else ""
-                    text += f"• <b>{name}</b> — <code>{uid}</code>{mark}\n"
-                text += "\n"
-
-        bot.send_message(call.message.chat.id, text)
-
-    elif call.data == "view_requests":
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🟡 Открытые заявки", callback_data="req_open"))
-        keyboard.add(types.InlineKeyboardButton("🟢 Активные заявки", callback_data="req_active"))
-        keyboard.add(types.InlineKeyboardButton("🔴 Закрытые заявки", callback_data="req_closed"))
-        keyboard.add(types.InlineKeyboardButton("↩ Назад", callback_data="back_to_main"))
-        bot.send_message(call.message.chat.id, "📌 Просмотр заявок:", reply_markup=keyboard)
-
-    elif call.data == "manager_requests":
-        bot.send_message(call.message.chat.id, "📨 Здесь будут отображены запросы от менеджмента (заглушка).\n✅/❌ для каждого.")
-
-    elif call.data == "back_to_main":
-        admin_panel(bot, call.message)
-    elif call.data == "list_staff_menu":
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(
-            types.InlineKeyboardButton("🧑‍💻 Операторы", callback_data="list_tp"),
-            types.InlineKeyboardButton("👔 Менеджеры", callback_data="list_manager"),
-            types.InlineKeyboardButton("🛡 Администраторы", callback_data="list_admin")
+    @bot.message_handler(commands=["admin"])
+    @require_role("admin")
+   
+    def admin_panel(message):
+        bot.send_message(
+            message.chat.id,
+            "👑 Админ-панель\n\n"
+            "/staff — сотрудники\n"
+            "/tickets — заявки\n"
+            "/manage_faq — FAQ"
         )
-        keyboard.add(types.InlineKeyboardButton("↩ Назад", callback_data="back_to_main"))
-        bot.send_message(call.message.chat.id, "👥 Выберите категорию сотрудников:", reply_markup=keyboard)
 
-    elif call.data.startswith("list_"):
-        role_map = {
-            "list_tp": "tp",
-            "list_manager": "manager",
-            "list_admin": "admin"
-        }
-        role = role_map.get(call.data)
-        if not role:
+    @bot.message_handler(func=lambda m: m.text == "❓ Управление FAQ")
+    def manage_faq(message):
+        user = get_current_user(message)
+        if not is_admin(user["role"]):
+            bot.send_message(message.chat.id, "⛔ Только администратор")
             return
-        role_display = {"tp": "Операторы", "manager": "Менеджеры", "admin": "Администраторы"}[role]
 
-        users = [u for u in db.ensure_and_get_users() if len(u) > 2 and u[2] == role]
-        if not users:
-            return bot.send_message(call.message.chat.id, f"⚠ Нет зарегистрированных {role_display.lower()}.")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("📋 Список FAQ", callback_data="faq:list"),
+            types.InlineKeyboardButton("➕ Добавить FAQ", callback_data="faq:add")
+        )
 
-        text = f"👥 <b>{role_display}:</b>\n\n"
-        for uid, name, _ in users:
-            is_base = (
-                (role == "admin" and uid in config.ADMIN_CHAT_ID) or
-                (role == "manager" and uid in config.MANAGER_CHAT_ID) or
-                (role == "tp" and uid in config.TP_CHAT_ID)
+        bot.send_message(
+            message.chat.id,
+            "<b>Управление FAQ</b>",
+            reply_markup=markup
             )
-            mark = " (встроенный)" if is_base else ""
-            text += f"• <b>{name}</b> — <code>{uid}</code>{mark}\n"
+    # =========================================================
+    # HELPERS
+    # =========================================================
 
-        bot.send_message(call.message.chat.id, text)
+    def get_current_user(message):
+        """
+        Определяем пользователя по таблице employees.
+        Если нет — считаем client.
+        """
+        emp = employees_db.get_employee_by_id_by_user_id(message.from_user.id) \
+            if hasattr(employees_db, "get_employee_by_id_by_user_id") else None
 
-# Добавление сотрудника — шаг 1 (имя)
-def process_new_user_name(bot, message):
-    if message.text and message.text.lower() == "назад":
-        return admin_panel(bot, message)
+        if emp:
+            return {
+                "user_id": emp["user_id"],
+                "role": emp["role"]
+            }
 
-    name = message.text.strip() if message.text else ""
-    if not name:
-        return bot.send_message(message.chat.id, "⚠ Имя не может быть пустым.")
+        return {
+            "user_id": message.from_user.id,
+            "role": "client"
+        }
 
-    admin_workflow[message.from_user.id] = {"name": name}
-    bot.send_message(message.chat.id, f'''🔢 Напишите <b>id Telegram профиля</b> администратора
-    Чтобы его узнать, <b>целевой</b> пользователь должен написать боту <b>IDBot</b> @myidbot в личные сообщения команду <code>/getid</code>''')
-    bot.register_next_step_handler(message, lambda m: process_new_user_id(bot, m))
 
-# Добавление сотрудника — шаг 2 (ID)
-def process_new_user_id(bot, message):
-    if message.text and message.text.lower() == "назад":
-        return admin_panel(bot, message)
+    # =========================================================
+    # START / MENU
+    # =========================================================
 
-    try:
-        user_id = int(message.text.strip())
-        if user_id <= 0:
-            raise ValueError
-        admin_workflow[message.from_user.id]["id"] = user_id
-        bot.send_message(message.chat.id, "📌 Введите роль: admin, manager или tp")
-        bot.register_next_step_handler(message, lambda m: process_new_user_role(bot, m))
-    except (ValueError, AttributeError):
-        bot.send_message(message.chat.id, "⚠ Неверный формат ID. Введите положительное число.")
+    @bot.message_handler(commands=["start"])
+    def start(message):
+        user = get_current_user(message)
 
-# Добавление сотрудника — шаг 3 (роль)
-def process_new_user_role(bot, message):
-    if message.text and message.text.lower() == "назад":
-        return admin_panel(bot, message)
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
 
-    role = message.text.strip().lower() if message.text else ""
-    if role not in ["admin", "manager", "tp"]:
-        return bot.send_message(message.chat.id, "⚠ Неверная роль. Введите: admin, manager или tp")
+        if is_staff(user["role"]):
+            markup.add("🎫 Заявки")
 
-    info = admin_workflow.get(message.from_user.id, {})
-    user_id = info.get("id")
-    name = info.get("name")
-    key = info.get("key") if role != "admin" else None
+        if can_manage_staff(user["role"]):
+            markup.add("👥 Сотрудники")
 
-    db.add_user(user_id, name, role, key)
-    bot.send_message(message.chat.id, f"✅ Сотрудник <b>{name}</b> с ролью <b>{role}</b> добавлен.")
-    admin_panel(bot, message)
+        if is_admin(user["role"]):
+            markup.add("❓ Управление FAQ")
+
+        bot.send_message(
+            message.chat.id,
+            "Административная панель:",
+            reply_markup=markup
+        )
+
+
+    # =========================================================
+    # STAFF
+    # =========================================================
+
+    @bot.message_handler(func=lambda m: m.text == "👥 Сотрудники")
+    def staff_menu(message):
+        user = get_current_user(message)
+
+        if not can_manage_staff(user["role"]):
+            bot.send_message(message.chat.id, "⛔ Недостаточно прав")
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("📋 Список", callback_data="staff:list"),
+            types.InlineKeyboardButton("➕ Добавить", callback_data="staff:add")
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "<b>Управление сотрудниками</b>",
+            reply_markup=markup
+        )
+
+
+    @bot.callback_query_handler(func=lambda c: c.data == "staff:list")
+    def staff_list(call):
+        items = employees_db.get_employees(include_inactive=True)
+
+        markup = types.InlineKeyboardMarkup()
+        for e in items:
+            status = "🟢" if e["is_active"] else "🔴"
+            markup.add(
+                types.InlineKeyboardButton(
+                    f"{status} {e['full_name']} ({e['role']})",
+                    callback_data=f"staff:view:{e['id']}"
+                )
+            )
+
+        bot.edit_message_text(
+            "📋 <b>Сотрудники</b>",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("staff:view"))
+    def staff_view(call):
+        emp_id = int(call.data.split(":")[2])
+        emp = employees_db.get_employee_by_id(emp_id)
+
+        text = (
+            f"<b>{emp['full_name']}</b>\n"
+            f"Роль: {emp['role']}\n"
+            f"Код: {emp['employee_code']}\n"
+            f"ID: {emp['user_id']}\n"
+            f"Статус: {'Активен' if emp['is_active'] else 'Неактивен'}"
+        )
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "🔁 Вкл/Выкл",
+                callback_data=f"staff:toggle:{emp_id}"
+            )
+        )
+        markup.add(types.InlineKeyboardButton("⬅ Назад", callback_data="staff:list"))
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("staff:toggle"))
+    def staff_toggle(call):
+        emp_id = int(call.data.split(":")[2])
+        emp = employees_db.get_employee_by_id(emp_id)
+
+        employees_db.set_employee_active(
+            current_user_id=call.from_user.id,
+            employee_id=emp_id,
+            is_active=not emp["is_active"]
+        )
+
+        bot.answer_callback_query(call.id, "Статус обновлён")
+        staff_list(call)
+
+
+    # =========================================================
+    # TICKETS (STAFF)
+    # =========================================================
+
+    @bot.message_handler(func=lambda m: m.text == "🎫 Заявки")
+    def tickets_menu(message):
+        user = get_current_user(message)
+
+        if not is_staff(user["role"]):
+            bot.send_message(message.chat.id, "⛔ Недостаточно прав")
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("📥 Новые", callback_data="tickets:new"),
+            types.InlineKeyboardButton("🔄 В работе", callback_data="tickets:in_progress")
+        )
+        markup.add(
+            types.InlineKeyboardButton("✅ Решённые", callback_data="tickets:resolved"),
+            types.InlineKeyboardButton("📁 Закрытые", callback_data="tickets:closed")
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "<b>Заявки</b>",
+            reply_markup=markup
+        )
+
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("tickets:"))
+    def tickets_list(call):
+        status = call.data.split(":")[1]
+        items = tickets_db.get_tickets_by_status(status)
+
+        markup = types.InlineKeyboardMarkup()
+        for t in items:
+            markup.add(
+                types.InlineKeyboardButton(
+                    f"{t['ticket_number']} ({t['priority']})",
+                    callback_data=f"ticket:view:{t['id']}"
+                )
+            )
+
+        markup.add(types.InlineKeyboardButton("⬅ Назад", callback_data="tickets:menu"))
+
+        bot.edit_message_text(
+            f"📋 Заявки [{status}]",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("ticket:view"))
+    def ticket_view(call):
+        ticket_id = int(call.data.split(":")[2])
+        ticket = tickets_db.get_ticket_by_id(ticket_id)
+        messages = tickets_db.get_ticket_messages(ticket_id)
+
+        text = (
+            f"<b>{ticket['ticket_number']}</b>\n"
+            f"Статус: {ticket['status']}\n"
+            f"Приоритет: {ticket['priority']}\n\n"
+            f"<b>Диалог:</b>\n"
+        )
+
+        for m in messages:
+            who = "Клиент" if m["user_id"] == ticket["user_id"] else "Сотрудник"
+            text += f"\n<b>{who}:</b> {m['content']}"
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "✉ Ответить",
+                callback_data=f"ticket:reply:{ticket_id}"
+            ),
+            types.InlineKeyboardButton(
+                "🔄 В работу",
+                callback_data=f"ticket:status:{ticket_id}:in_progress"
+            ),
+            types.InlineKeyboardButton(
+                "✅ Закрыть",
+                callback_data=f"ticket:status:{ticket_id}:closed"
+            )
+        )
+        markup.add(types.InlineKeyboardButton("⬅ Назад", callback_data="tickets:menu"))
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("ticket:reply"))
+    def ticket_reply_start(call):
+        ticket_id = int(call.data.split(":")[2])
+        state.set(call.from_user.id, "ticket_reply", {"ticket_id": ticket_id})
+        bot.send_message(call.message.chat.id, "Введите ответ клиенту:")
+
+
+    @bot.message_handler(func=lambda m: state.get_state(m.from_user.id) == "ticket_reply")
+    def ticket_reply_send(message):
+        data = state.get(message.from_user.id)
+
+        tickets_db.add_ticket_message(
+            ticket_id=data["ticket_id"],
+            user_id=message.from_user.id,
+            content=message.text
+        )
+
+        state.clear(message.from_user.id)
+        bot.send_message(message.chat.id, "✅ Ответ отправлен")
+
+
+    # =========================================================
+    # FAQ MANAGEMENT (ADMIN)
+    # =========================================================

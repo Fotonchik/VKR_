@@ -1,4 +1,16 @@
+# client_bot.py - ПРАВИЛЬНЫЙ ВАРИАНТ
+import telebot
 from telebot import types
+import config
+import random
+import db
+import db_tickets
+import format
+
+# ПРАВИЛЬНО: BOT_TOKEN должен быть СТРОКОЙ из config.BOT_TOKEN
+BOT_TOKEN = config.BOT_TOKEN  # строка с токеном
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
 
 # Кнопки меню администратора
 button_hello_text = "Приветствие"

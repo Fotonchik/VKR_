@@ -1,27 +1,38 @@
-import sqlite3
+# create_db.py
 
-# Укажите путь к новому файлу базы данных
-db_path = 'C:\\Users\\Фотончик\\OneDrive\\Desktop\\домашка\\BKR\\08code\\orders-tg-bot-master\\orders.db'
+import config
 
-# Подключение к базе данных (если файл не существует, он будет создан)
-conn = sqlite3.connect(db_path)
-cur = conn.cursor()
+from db import employees
+from db import db_faq
+from db import db_tickets
 
-# Создание таблицы, если она не существует
-cur.execute('''
-CREATE TABLE IF NOT EXISTS `order` (
-    `id` INTEGER PRIMARY KEY AUTOINCREMENT,
-    `user_id` TEXT,
-    `date` DATE,
-    `telephone` TEXT,
-    `address` TEXT,
-    `order_list` TEXT,
-    status INTEGER DEFAULT 0
-)
-''')
 
-# Сохранение изменений и закрытие соединения
-conn.commit()
-conn.close()
+# =========================================================
+# MAIN INIT (используется bot.py)
+# =========================================================
 
-print("Новый файл базы данных создан и таблица `order` добавлена.")
+def init_database():
+    """
+    Единая точка инициализации БД.
+    НЕ содержит SQL.
+    """
+    print("▶ Инициализация базы данных...")
+
+    employees.init_table()
+    print("✔ employees")
+
+    # bootstrap admin
+    admin_id = getattr(config, "BOOTSTRAP_ADMIN_ID", None)
+    if admin_id:
+        employees.create_admin_if_not_exists(admin_id)
+        print("✔ bootstrap admin")
+
+    print("✅ База данных полностью готова.")
+
+
+# =========================================================
+# MANUAL RUN
+# =========================================================
+
+if __name__ == "__main__":
+    init_database()
